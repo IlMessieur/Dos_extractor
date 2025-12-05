@@ -1,0 +1,318 @@
+import pydicom
+from pydicom.dataset import Dataset, FileDataset
+from pydicom.uid import generate_uid
+import os
+import datetime
+from pathlib import Path
+import json
+
+class DICOMAnonymizer:
+    """
+    Classe per anonimizzare file DICOM rimuovendo dati sensibili
+    mantenendo le informazioni cliniche necessarie.
+    """
+    
+    def __init__(self, backup_original=True):
+        """
+        Inizializza l'anonymizer
+        
+        Args:
+            backup_original: Se True, crea una copia del file originale
+        """
+        self.backup_original = backup_original
+        
+        # Campi da rimuovere completamente (dati paziente)
+        self.tags_to_remove = [
+            (0x0010, 0x0010),  # Patient's Name
+            (0x0010, 0x0020),  # Patient ID
+            (0x0010, 0x0030),  # Patient's Birth Date
+            (0x0010, 0x0040),  # Patient's Sex
+            (0x0010, 0x1000),  # Other Patient IDs
+            (0x0010, 0x1001),  # Other Patient Names
+            (0x0010, 0x1005),  # Patient's Birth Name
+            (0x0010, 0x1010),  # Patient's Age
+            (0x0010, 0x1030),  # Patient's Weight
+            (0x0010, 0x1040),  # Patient's Address
+            (0x0010, 0x1060),  # Patient's Mother's Birth Name
+            (0x0010, 0x1080),  # Military Rank
+            (0x0010, 0x1081),  # Branch of Service
+            (0x0010, 0x1090),  # Medical Record Locator
+            (0x0010, 0x2000),  # Medical Alerts
+            (0x0010, 0x2110),  # Allergies
+            (0x0010, 0x2150),  # Country of Residence
+            (0x0010, 0x2152),  # Region of Residence
+            (0x0010, 0x2154),  # Patient's Telephone Numbers
+            (0x0010, 0x2160),  # Ethnic Group
+            (0x0010, 0x2180),  # Occupation
+            (0x0010, 0x21A0),  # Smoking Status
+            (0x0010, 0x21B0),  # Additional Patient History
+            (0x0010, 0x21C0),  # Pregnancy Status
+            (0x0010, 0x21D0),  # Last Menstrual Date
+            (0x0010, 0x21F0),  # Patient's Religious Preference
+            (0x0010, 0x2297),  # Issuer of Patient ID
+            (0x0010, 0x2299),  # Type of Patient ID
+        ]
+        
+        # Campi da anonimizzare (mantenere struttura ma sostituire valori)
+        self.tags_to_anonymize = [
+            (0x0008, 0x0080),  # Institution Name -> "INSTITUTION_ANONYMIZED"
+            (0x0008, 0x0081),  # Institution Address -> "ADDRESS_ANONYMIZED"
+            (0x0008, 0x0090),  # Referring Physician's Name -> "PHYSICIAN_ANONYMIZED"
+            (0x0008, 0x0092),  # Referring Physician's Address -> "ADDRESS_ANONYMIZED"
+            (0x0008, 0x0094),  # Referring Physician's Telephone Numbers
+            (0x0008, 0x1010),  # Station Name -> "STATION_ANONYMIZED"
+            (0x0008, 0x1040),  # Institutional Department Name
+            (0x0008, 0x1048),  # Physician(s) of Record
+            (0x0008, 0x1050),  # Performing Physician's Name
+            (0x0008, 0x1060),  # Name of Physician(s) Reading Study
+            (0x0008, 0x1070),  # Operators' Name
+        ]
+
+    def anonymize_single_file(self, input_path, output_path=None):
+        """
+        Anonimizza un singolo file DICOM
+        
+        Args:
+            input_path: Percorso del file DICOM originale
+            output_path: Percorso del file anonimizzato (se None, sovrascrive)
+        
+        Returns:
+            dict: Report delle modifiche effettuate
+        """
+        try:
+            # Legge il file DICOM
+            ds = pydicom.dcmread(input_path, force=True)
+            
+            # Crea una copia di backup se richiesto
+            if self.backup_original and output_path is None:
+                backup_path = input_path.replace('.dcm', '_original.dcm')
+                if not os.path.exists(backup_path):
+                    ds.save_as(backup_path)
+            
+            # Report delle modifiche
+            report = {
+                'filename': os.path.basename(input_path),
+                'removed_tags': [],
+                'anonymized_tags': [],
+                'errors': []
+            }
+            
+            # 1. Rimuove i tag sensibili
+            for tag in self.tags_to_remove:
+                if tag in ds:
+                    try:
+                        tag_name = ds[tag].name
+                        report['removed_tags'].append(tag_name)
+                        del ds[tag]
+                    except Exception as e:
+                        report['errors'].append(f"Error removing {tag}: {str(e)}")
+            
+            # 2. Anonimizza altri tag
+            for tag in self.tags_to_anonymize:
+                if tag in ds:
+                    try:
+                        tag_name = ds[tag].name
+                        original_value = str(ds[tag].value)
+                        
+                        # Sostituisce con valori anonimizzati
+                        if 'Name' in tag_name or 'Physician' in tag_name:
+                            ds[tag].value = "ANONYMIZED"
+                        elif 'Address' in tag_name:
+                            ds[tag].value = "ADDRESS_ANONYMIZED"
+                        elif 'Telephone' in tag_name:
+                            ds[tag].value = "000-0000000"
+                        else:
+                            ds[tag].value = "REMOVED"
+                        
+                        report['anonymized_tags'].append({
+                            'tag': tag_name,
+                            'original': original_value[:50] + "..." if len(original_value) > 50 else original_value,
+                            'new': ds[tag].value
+                        })
+                    except Exception as e:
+                        report['errors'].append(f"Error anonymizing {tag}: {str(e)}")
+            
+            # 3. Genera nuovi ID anonimi
+            self._generate_anonymous_ids(ds)
+            
+            # 4. Rimuove dati privati dal file meta
+            self._clean_file_meta(ds)
+            
+            # 5. Salva il file anonimizzato
+            if output_path is None:
+                output_path = input_path
+            
+            # Assicura che la directory di output esista
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            
+            ds.save_as(output_path, write_like_original=False)
+            
+            report['output_path'] = output_path
+            report['success'] = True
+            
+            return report
+            
+        except Exception as e:
+            return {
+                'filename': os.path.basename(input_path),
+                'success': False,
+                'error': str(e)
+            }
+    
+    def _generate_anonymous_ids(self, dataset):
+        """Genera ID anonimi per il dataset"""
+        # Patient ID anonimo
+        if (0x0010, 0x0020) not in dataset:
+            dataset.PatientID = f"ANON{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}"
+        
+        # Study Instance UID anonimo
+        if hasattr(dataset, 'StudyInstanceUID'):
+            dataset.StudyInstanceUID = generate_uid()
+        
+        # Series Instance UID anonimo
+        if hasattr(dataset, 'SeriesInstanceUID'):
+            dataset.SeriesInstanceUID = generate_uid()
+        
+        # SOP Instance UID anonimo
+        if hasattr(dataset, 'SOPInstanceUID'):
+            dataset.SOPInstanceUID = generate_uid()
+    
+    def _clean_file_meta(self, dataset):
+        """Pulisce i metadati del file"""
+        if hasattr(dataset, 'file_meta'):
+            # Rimuove Transfer Syntax UID se presente
+            if (0x0002, 0x0010) in dataset.file_meta:
+                # Mantiene solo informazioni non identificative
+                pass
+    
+    def batch_anonymize(self, input_folder, output_folder=None):
+        """
+        Anonimizza tutti i file DICOM in una cartella
+        
+        Args:
+            input_folder: Cartella con file DICOM originali
+            output_folder: Cartella per file anonimizzati (se None, sovrascrive)
+        
+        Returns:
+            list: Report per tutti i file processati
+        """
+        reports = []
+        
+        # Cerca tutti i file DICOM (estensione comune .dcm, .ima, .dicom)
+        dicom_extensions = ['.dcm', '.ima', '.dicom', '.DCM', '.IMA']
+        
+        for ext in dicom_extensions:
+            for file_path in Path(input_folder).glob(f'**/*{ext}'):
+                # Determina il percorso di output
+                if output_folder:
+                    rel_path = file_path.relative_to(input_folder)
+                    output_path = Path(output_folder) / rel_path
+                else:
+                    output_path = None
+                
+                # Anonimizza il file
+                report = self.anonymize_single_file(str(file_path), 
+                                                   str(output_path) if output_path else None)
+                reports.append(report)
+        
+        return reports
+    
+    def generate_report(self, reports, output_file='anonymization_report.json'):
+        """
+        Genera un report JSON delle operazioni di anonimizzazione
+        
+        Args:
+            reports: Lista di report restituiti da anonymize_single_file o batch_anonymize
+            output_file: Percorso del file di output
+        """
+        summary = {
+            'total_files': len(reports),
+            'successful': sum(1 for r in reports if r.get('success', False)),
+            'failed': sum(1 for r in reports if not r.get('success', False)),
+            'details': reports,
+            'timestamp': datetime.datetime.now().isoformat()
+        }
+        
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
+        
+        print(f"Report salvato in: {output_file}")
+        return summary
+
+
+def main():
+    """
+    Interfaccia a linea di comando per l'anonimizzazione DICOM
+    """
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Anonimizza file DICOM')
+    parser.add_argument('input', help='Percorso del file o cartella DICOM')
+    parser.add_argument('-o', '--output', help='Cartella di output (opzionale)')
+    parser.add_argument('-r', '--report', help='File di report JSON', default='anonymization_report.json')
+    parser.add_argument('--no-backup', action='store_true', help='Non creare backup dei file originali')
+    
+    args = parser.parse_args()
+    
+    # Crea l'anonymizer
+    anonymizer = DICOMAnonymizer(backup_original=not args.no_backup)
+    
+    # Verifica se l'input Ã¨ un file o una cartella
+    if os.path.isfile(args.input):
+        # Anonimizza un singolo file
+        print(f"Anonimizzazione del file: {args.input}")
+        report = anonymizer.anonymize_single_file(args.input, args.output)
+        
+        if report['success']:
+            print("âœ“ File anonimizzato con successo")
+            print(f"  Tag rimossi: {len(report['removed_tags'])}")
+            print(f"  Tag anonimizzati: {len(report['anonymized_tags'])}")
+        else:
+            print(f"âœ— Errore: {report.get('error', 'Errore sconosciuto')}")
+        
+        # Salva il report
+        anonymizer.generate_report([report], args.report)
+        
+    elif os.path.isdir(args.input):
+        # Anonimizza una cartella intera
+        print(f"Anonimizzazione della cartella: {args.input}")
+        reports = anonymizer.batch_anonymize(args.input, args.output)
+        
+        # Genera report
+        summary = anonymizer.generate_report(reports, args.report)
+        
+        print(f"\nRiepilogo:")
+        print(f"  File totali: {summary['total_files']}")
+        print(f"  Successi: {summary['successful']}")
+        print(f"  Falliti: {summary['failed']}")
+        
+    else:
+        print(f"Errore: Il percorso {args.input} non esiste")
+        return 1
+    
+    return 0
+
+
+if __name__ == "__main__":
+    # Esempio di utilizzo interattivo
+    print("=== DICOM Anonymizer ===")
+    
+    # Chiede all'utente il percorso del file/cartella
+    input_path = input("Inserisci il percorso del file o cartella DICOM: ").strip()
+    
+    if not os.path.exists(input_path):
+        print("Percorso non valido. Usa uno di questi formati:")
+        print("  - Singolo file: C:/cartella/file.dcm")
+        print("  - Cartella: C:/cartella/esami/")
+    else:
+        output_option = input("Cartella di output (premi Invio per sovrascrivere): ").strip()
+        output_path = output_option if output_option else None
+        
+        anonymizer = DICOMAnonymizer(backup_original=True)
+        
+        if os.path.isfile(input_path):
+            report = anonymizer.anonymize_single_file(input_path, output_path)
+        else:
+            reports = anonymizer.batch_anonymize(input_path, output_path)
+            anonymizer.generate_report(reports)
+            print(f"\nProcessati {len(reports)} file DICOM")
