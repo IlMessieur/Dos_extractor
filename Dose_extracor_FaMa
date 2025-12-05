@@ -1,0 +1,45 @@
+import pydicom
+
+def extract_dose_from_rdsr(rdsr_file_path):
+    """Extracts summary dose information from a DICOM RDSR file."""
+    
+    ds = pydicom.dcmread(rdsr_file_path, force=True)
+    print(f"Reading RDSR: {rdsr_file_path}")
+    
+    # Check if this is likely an RDSR by its SOP Class
+    if ds.SOPClassUID != '1.2.840.10008.5.1.4.1.1.88.67':
+        print("Warning: This may not be a standard Radiation Dose SR file.")
+    
+    # Initialize variables to accumulate dose for the whole study
+    total_dlp = 0.0
+    study_dose_info = []
+    
+    # Navigate the RDSR content sequence (simplified path)
+    # The actual structure can be vendor-specific and deeply nested.
+    if hasattr(ds, 'ContentSequence'):
+        for item in ds.ContentSequence:
+            # Look for a 'Container' that holds procedure summary
+            if hasattr(item, 'ConceptNameCodeSequence') and \
+               item.ConceptNameCodeSequence[0].CodeMeaning == 'Procedure reported':
+                # Within this container, find children with dose details
+                if hasattr(item, 'ContentSequence'):
+                    for child in item.ContentSequence:
+                        # Extract CTDIvol
+                        if hasattr(child, 'ConceptNameCodeSequence') and \
+                           child.ConceptNameCodeSequence[0].CodeMeaning == 'CTDIvol':
+                            ctdivol_value = child.MeasuredValueSequence[0].NumericValue
+                            ctdivol_unit = child.MeasuredValueSequence[0].MeasurementUnitsCodeSequence[0].CodeValue
+                            print(f"  CTDIvol: {ctdivol_value} {ctdivol_unit}")
+                        
+                        # Extract and accumulate DLP
+                        elif hasattr(child, 'ConceptNameCodeSequence') and \
+                             child.ConceptNameCodeSequence[0].CodeMeaning == 'DLP':
+                            dlp_value = child.MeasuredValueSequence[0].NumericValue
+                            total_dlp += dlp_value
+                            dlp_unit = child.MeasuredValueSequence[0].MeasurementUnitsCodeSequence[0].CodeValue
+    
+    print(f"  Total Study DLP: {total_dlp} {dlp_unit}")
+    return total_dlp
+
+# Example usage
+total_study_dlp = extract_dose_from_rdsr('path/to/your/dose_report.dcm')
